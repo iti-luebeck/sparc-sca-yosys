@@ -5,6 +5,8 @@
 
 USING_YOSYS_NAMESPACE
 extern std::vector<RTLIL::SigSpec> get_corresponding_taint_signals(RTLIL::Module* module, std::vector<string> *excluded_signals, const RTLIL::SigSpec &sig, unsigned int num_taints);
+extern std::string get_wire_leakage_idstring(RTLIL::IdString id_string, unsigned int leakage_id);
+extern std::vector<RTLIL::SigSpec> get_corresponding_leakage_signals(RTLIL::Module* module, std::vector<string> *excluded_signals, const RTLIL::SigSpec &sig, unsigned int num_leakages);
 
 /**
  * @param module the current module instance
@@ -18,11 +20,16 @@ bool cellift_mux(RTLIL::Module *module, RTLIL::Cell *cell, unsigned int num_tain
     const unsigned int NUM_PORTS = 4;
     RTLIL::SigSpec ports[NUM_PORTS] = {cell->getPort(ID::A), cell->getPort(ID::B), cell->getPort(ID::S), cell->getPort(ID::Y)};
     std::vector<RTLIL::SigSpec> port_taints[NUM_PORTS];
+    std::vector<RTLIL::SigSpec> port_leakages[NUM_PORTS];
 
     if (ports[A].size() != ports[B].size() || ports[B].size() != ports[Y].size())
         log_cmd_error("In $mux, all data ports must have the same size.\n");
     for (unsigned int i = 0; i < NUM_PORTS; ++i)
         port_taints[i] = get_corresponding_taint_signals(module, excluded_signals, ports[i], num_taints);
+    
+    // Phase 3: Get leakage shadows for output port (simplified model: leak = taint)
+    for (unsigned int i = 0; i < NUM_PORTS; ++i)
+        port_leakages[i] = get_corresponding_leakage_signals(module, excluded_signals, ports[i], num_taints);
 
     int data_size = ports[A].size();
     RTLIL::SigSpec extended_s = RTLIL::SigSpec(RTLIL::SigBit(ports[S]), data_size);
@@ -44,6 +51,24 @@ bool cellift_mux(RTLIL::Module *module, RTLIL::Cell *cell, unsigned int num_tain
 
         // Output taint.
         module->addOr(NEW_ID, s_taint_and_a_xor_b, data_taint_stream, port_taints[Y][taint_id]);
+        
+        // Phase 3: Drive leakage output with taint (simplified model for combinational)
+        RTLIL::SigSpec leakage_output = port_taints[Y][taint_id];
+        
+        // Connect to output port if this mux output is a module port
+        if (ports[Y].is_wire() && ports[Y].as_wire()->port_output) {
+            // Get the leakage port for this output
+            std::string leak_name = get_wire_leakage_idstring(ports[Y].as_wire()->name.str(), taint_id);
+            RTLIL::Wire *leak_port = module->wire(RTLIL::IdString(leak_name));
+            
+            if (leak_port && leak_port->port_output) {
+                // Connect internal leakage logic to the output port
+                module->connect(leak_port, leakage_output);
+            }
+        }
+        
+        // Always connect internal leakage wire (for non-port signals and hierarchy)
+        module->connect(port_leakages[Y][taint_id], leakage_output);
     }
 
     return true;

@@ -24,6 +24,7 @@
 #include "kernel/rtlil.h"
 #include "kernel/utils.h"
 #include "kernel/yosys.h"
+#include "kernel/sigtools.h"
 
 USING_YOSYS_NAMESPACE
 
@@ -31,6 +32,15 @@ extern bool is_signal_excluded(std::vector<string> *excluded_signals, string sig
 extern std::string get_wire_taint_idstring(RTLIL::IdString id_string, unsigned int taint_id);
 extern std::vector<RTLIL::SigSpec> get_corresponding_taint_signals(RTLIL::Module *module, std::vector<string> *excluded_signals,
 								   const RTLIL::SigSpec &sig, unsigned int num_taints);
+
+// Power leakage tracking functions (new in Phase 1)
+extern std::string get_wire_leakage_idstring(RTLIL::IdString id_string, unsigned int leakage_id);
+extern std::vector<RTLIL::SigSpec> get_corresponding_leakage_signals(RTLIL::Module *module, std::vector<string> *excluded_signals,
+									  const RTLIL::SigSpec &sig, unsigned int num_leakages);
+extern bool is_clock_or_reset_signal(RTLIL::IdString signal_name);
+
+// Power leakage handlers (new in Phase 2)
+extern bool cellift_dff_with_leakage(RTLIL::Module *module, RTLIL::Cell *cell, unsigned int num_taints, std::vector<string> *excluded_signals);
 
 extern bool cellift_dlatch(RTLIL::Module *module, RTLIL::Cell *cell, unsigned int num_taints, std::vector<string> *excluded_signals);
 extern bool cellift_dlatch_en(RTLIL::Module *module, RTLIL::Cell *cell, unsigned int num_taints, std::vector<string> *excluded_signals);
@@ -88,11 +98,321 @@ extern bool rtlift_add(RTLIL::Module *module, RTLIL::Cell *cell, unsigned int nu
 
 PRIVATE_NAMESPACE_BEGIN
 
+static RTLIL::SigSpec zero_extend_to_32(const RTLIL::SigSpec &sig)
+{
+	RTLIL::SigSpec out = sig;
+	if (out.size() < 32)
+		out.append(RTLIL::SigSpec(RTLIL::State::S0, 32 - out.size()));
+	return out;
+}
+
+static RTLIL::SigSpec add_to_accum(RTLIL::Module *module, const RTLIL::SigSpec &accum, const RTLIL::SigSpec &addend)
+{
+	RTLIL::SigSpec acc32 = zero_extend_to_32(accum);
+	RTLIL::SigSpec add32 = zero_extend_to_32(addend);
+	return module->Add(NEW_ID, acc32, add32);
+}
+
+static RTLIL::SigSpec popcount_bits(RTLIL::Module *module, const RTLIL::SigSpec &bits)
+{
+	RTLIL::SigSpec acc = RTLIL::SigSpec(RTLIL::State::S0, 32);
+	for (int i = 0; i < bits.size(); ++i) {
+		RTLIL::SigSpec bit = bits.extract(i, 1);
+		acc = add_to_accum(module, acc, bit);
+	}
+	return acc;
+}
+
+// General function to add HW/HD counters to any module
+// This works for top modules as well as internal core modules
+static void add_hw_hd_counters_to_module(RTLIL::Module *target_module, unsigned int num_taints, bool opt_verbose, bool is_top_module)
+{
+	if (opt_verbose)
+		log("Adding HW/HD counters to module %s (is_top=%d)\n", target_module->name.c_str(), is_top_module);
+
+	// Identify a clock and optional reset in the target module.
+	RTLIL::Wire *clk_wire = nullptr;
+	RTLIL::Wire *rst_wire = nullptr;
+	for (auto &wire_it : target_module->wires_) {
+		RTLIL::Wire *w = wire_it.second;
+		if (!w->port_input)
+			continue;
+		std::string n = w->name.str();
+		// Skip taint/leakage variants when selecting clocks/resets.
+		if (n.find("_t0") != std::string::npos || n.find("_leak") != std::string::npos)
+			continue;
+		// Prefer the main system clock if present.
+		if (n == "\\clk_i" || n.find("clk_i") != std::string::npos) {
+			clk_wire = w;
+			continue;
+		}
+		if (!clk_wire && (n.find("clk") != std::string::npos || n.find("clock") != std::string::npos))
+			clk_wire = w;
+		if (!rst_wire && (n == "\\rst_ni" || n.find("rst") != std::string::npos || n.find("reset") != std::string::npos))
+			rst_wire = w;
+	}
+
+	if (!clk_wire && opt_verbose)
+		log("  Warning: No clock input found in module %s; leakage counters will not be registered.\n", target_module->name.c_str());
+
+	// Build dictionary of data wires (excluding taint and leakage signals)
+	dict<std::string, RTLIL::Wire *> data_wires;
+	dict<std::string, RTLIL::Wire *> prev_wires;
+	for (auto &wire_it : target_module->wires_) {
+		RTLIL::Wire *w = wire_it.second;
+		std::string n = w->name.str();
+		if (n.find("_t") != std::string::npos || n.find("_leak") != std::string::npos)
+			continue;
+		if (is_clock_or_reset_signal(w->name))
+			continue;
+		data_wires[n] = w;
+	}
+
+	// Create HW/HD counters for each taint label
+	for (unsigned int taint_id = 0; taint_id < num_taints; ++taint_id) {
+		std::string taint_suffix = "_t" + std::to_string(taint_id);
+		RTLIL::SigSpec hw_bits;
+		RTLIL::SigSpec hd_bits;
+
+		// Iterate through all wires in the target module, looking for tainted signals
+		for (auto &wire_it : target_module->wires_) {
+			RTLIL::Wire *taint_wire = wire_it.second;
+			std::string tn = taint_wire->name.str();
+			
+			// Check if this is a taint signal (ends with _t<id>)
+			if (tn.size() <= taint_suffix.size())
+				continue;
+			if (tn.find(taint_suffix) == std::string::npos)
+				continue;
+			if (tn.compare(tn.size() - taint_suffix.size(), taint_suffix.size(), taint_suffix) != 0)
+				continue;
+			
+			// Find the corresponding data wire
+			std::string base_name = tn.substr(0, tn.size() - taint_suffix.size());
+			auto it = data_wires.find(base_name);
+			if (it == data_wires.end())
+				continue;
+			RTLIL::Wire *data_wire = it->second;
+
+			// HW: AND(data, taint) for each bit
+			RTLIL::SigSpec data_sig(data_wire);
+			RTLIL::SigSpec taint_sig(taint_wire);
+			RTLIL::SigSpec and_sig = target_module->And(NEW_ID, data_sig, taint_sig);
+			hw_bits.append(and_sig);
+
+			// HD: XOR(data, data_prev) AND taint for each bit
+			if (clk_wire) {
+				RTLIL::Wire *prev_wire = nullptr;
+				auto prev_it = prev_wires.find(base_name);
+				if (prev_it != prev_wires.end()) {
+					prev_wire = prev_it->second;
+				} else {
+					std::string prev_name = base_name + "_prev_hw_hd";
+					prev_wire = target_module->addWire(RTLIL::escape_id(prev_name), data_wire->width);
+					target_module->addDff(NEW_ID, RTLIL::SigSpec(clk_wire), data_sig, RTLIL::SigSpec(prev_wire));
+					prev_wires[base_name] = prev_wire;
+				}
+				RTLIL::SigSpec xor_sig = target_module->Xor(NEW_ID, data_sig, RTLIL::SigSpec(prev_wire));
+				RTLIL::SigSpec hd_and = target_module->And(NEW_ID, xor_sig, taint_sig);
+				hd_bits.append(hd_and);
+			}
+		}
+
+		// Create HW counter output
+		if (hw_bits.size() > 0) {
+			std::string hw_name = "hamming_weight_counter_t" + std::to_string(taint_id);
+			RTLIL::Wire *hw_out = target_module->wire(RTLIL::escape_id(hw_name));
+			if (!hw_out) {
+				hw_out = target_module->addWire(RTLIL::escape_id(hw_name), 32);
+				hw_out->port_output = true;
+			}
+			RTLIL::SigSpec hw_count = popcount_bits(target_module, hw_bits);
+			if (clk_wire) {
+				RTLIL::Wire *hw_reg = target_module->addWire(NEW_ID, 32);
+				target_module->addDff(NEW_ID, RTLIL::SigSpec(clk_wire), hw_count, RTLIL::SigSpec(hw_reg));
+				target_module->connect(hw_out, hw_reg);
+			} else {
+				target_module->connect(hw_out, hw_count);
+			}
+			if (opt_verbose)
+				log("  Created HW counter for taint %d: %d tainted bits\n", taint_id, hw_bits.size());
+		} else if (opt_verbose) {
+			log("  Warning: No tainted signals found for taint %d in module %s\n", taint_id, target_module->name.c_str());
+		}
+
+		// Create HD counter output
+		if (hd_bits.size() > 0) {
+			std::string hd_name = "hamming_distance_counter_t" + std::to_string(taint_id);
+			RTLIL::Wire *hd_out = target_module->wire(RTLIL::escape_id(hd_name));
+			if (!hd_out) {
+				hd_out = target_module->addWire(RTLIL::escape_id(hd_name), 32);
+				hd_out->port_output = true;
+			}
+			RTLIL::SigSpec hd_count = popcount_bits(target_module, hd_bits);
+			if (clk_wire) {
+				RTLIL::Wire *hd_reg = target_module->addWire(NEW_ID, 32);
+				target_module->addDff(NEW_ID, RTLIL::SigSpec(clk_wire), hd_count, RTLIL::SigSpec(hd_reg));
+				target_module->connect(hd_out, hd_reg);
+			} else {
+				target_module->connect(hd_out, hd_count);
+			}
+			if (opt_verbose)
+				log("  Created HD counter for taint %d: %d tainted transition bits\n", taint_id, hd_bits.size());
+		}
+	}
+
+	target_module->fixup_ports();
+}
+
+// Function to promote counter outputs hierarchically from child module to parent
+static void promote_counters_hierarchically(RTLIL::Design *design, RTLIL::Module *child_module, unsigned int num_taints, bool opt_verbose)
+{
+	if (opt_verbose)
+		log("Promoting counters from module %s to parent modules\n", child_module->name.c_str());
+
+	// Find all parent modules that instantiate this child module
+	std::vector<std::pair<RTLIL::Module*, RTLIL::Cell*>> parent_instances;
+	for (auto parent_mod : design->modules()) {
+		for (auto cell : parent_mod->cells()) {
+			if (design->module(cell->type) == child_module) {
+				parent_instances.push_back(std::make_pair(parent_mod, cell));
+			}
+		}
+	}
+
+	if (parent_instances.empty()) {
+		if (opt_verbose)
+			log("  Module %s is top-level, no promotion needed\n", child_module->name.c_str());
+		return;
+	}
+
+	// For each parent instance, connect child counters to parent wires
+	for (auto &parent_pair : parent_instances) {
+		RTLIL::Module *parent = parent_pair.first;
+		RTLIL::Cell *inst_cell = parent_pair.second;
+		std::string inst_name = inst_cell->name.str();
+
+		if (opt_verbose)
+			log("  Promoting to parent %s via instance %s\n", parent->name.c_str(), inst_name.c_str());
+
+		for (unsigned int taint_id = 0; taint_id < num_taints; ++taint_id) {
+			// Promote HW counter
+			std::string hw_name = "hamming_weight_counter_t" + std::to_string(taint_id);
+			RTLIL::IdString hw_port = RTLIL::escape_id(hw_name);
+			RTLIL::Wire *child_hw = child_module->wire(hw_port);
+			
+			if (child_hw && child_hw->port_output) {
+				// Create wire in parent module
+				std::string parent_hw_name = inst_name + "_" + hw_name;
+				RTLIL::IdString parent_hw_id = RTLIL::escape_id(parent_hw_name);
+				RTLIL::Wire *parent_hw = parent->wire(parent_hw_id);
+				if (!parent_hw) {
+					parent_hw = parent->addWire(parent_hw_id, 32);
+					if (opt_verbose)
+						log("    Created wire %s in parent\n", parent_hw_name.c_str());
+				}
+				
+				// Connect instance port to parent wire
+				inst_cell->setPort(hw_port, RTLIL::SigSpec(parent_hw));
+			}
+
+			// Promote HD counter
+			std::string hd_name = "hamming_distance_counter_t" + std::to_string(taint_id);
+			RTLIL::IdString hd_port = RTLIL::escape_id(hd_name);
+			RTLIL::Wire *child_hd = child_module->wire(hd_port);
+			
+			if (child_hd && child_hd->port_output) {
+				// Create wire in parent module
+				std::string parent_hd_name = inst_name + "_" + hd_name;
+				RTLIL::IdString parent_hd_id = RTLIL::escape_id(parent_hd_name);
+				RTLIL::Wire *parent_hd = parent->wire(parent_hd_id);
+				if (!parent_hd) {
+					parent_hd = parent->addWire(parent_hd_id, 32);
+					if (opt_verbose)
+						log("    Created wire %s in parent\n", parent_hd_name.c_str());
+				}
+				
+				// Connect instance port to parent wire
+				inst_cell->setPort(hd_port, RTLIL::SigSpec(parent_hd));
+			}
+		}
+
+		parent->fixup_ports();
+	}
+}
+
+// Auto-detect modules that contain tainted signals
+static std::vector<RTLIL::Module*> detect_tainted_modules(RTLIL::Design *design, bool opt_verbose)
+{
+	std::vector<RTLIL::Module*> tainted_modules;
+	
+	for (auto module : design->modules()) {
+		// Skip Yosys internal modules
+		if (module->name.begins_with("\\$"))
+			continue;
+		
+		// Check if module has any tainted signals
+		bool has_taint = false;
+		for (auto &wire_it : module->wires_) {
+			std::string wire_name = wire_it.second->name.str();
+			if (wire_name.find("_t0") != std::string::npos || wire_name.find("_t1") != std::string::npos) {
+				has_taint = true;
+				break;
+			}
+		}
+		
+		if (has_taint) {
+			tainted_modules.push_back(module);
+			if (opt_verbose)
+				log("Auto-detected tainted module: %s\n", module->name.c_str());
+		}
+	}
+	
+	return tainted_modules;
+}
+
+// Find modules by base name, handling $paramod prefixes and wildcards
+static std::vector<RTLIL::Module*> find_modules_by_name(RTLIL::Design *design, const std::string &base_name, bool opt_verbose)
+{
+	std::vector<RTLIL::Module*> found_modules;
+	
+	// First try exact match (with backslash prefix)
+	RTLIL::IdString exact_id = RTLIL::escape_id(base_name);
+	RTLIL::Module *exact_match = design->module(exact_id);
+	if (exact_match) {
+		found_modules.push_back(exact_match);
+		if (opt_verbose)
+			log("    Found exact match: %s\n", base_name.c_str());
+		return found_modules;
+	}
+	
+	// If no exact match, search for modules with matching base name
+	// This handles $paramod$HASH\base_name format
+	std::string search_pattern = base_name;
+	if (search_pattern[0] == '\\')
+		search_pattern = search_pattern.substr(1);  // Remove backslash for pattern matching
+	
+	for (auto module : design->modules()) {
+		std::string mod_name = module->name.str();
+		
+		// Check if module name ends with our search pattern
+		// This catches $paramod$HASH\cellift_ibex_core when searching for cellift_ibex_core
+		if (mod_name.find("\\" + search_pattern) != std::string::npos) {
+			found_modules.push_back(module);
+			if (opt_verbose)
+				log("    Found parametrized match: %s (searched for %s)\n", mod_name.c_str(), base_name.c_str());
+		}
+	}
+	
+	return found_modules;
+}
+
 struct CellIFTWorker {
       private:
 	// Command line arguments.
 	bool opt_verbose = false;
 	bool opt_rtlift = false;		     // Whether to implement the adder/multiplier using the RTLIFT fashion.
+	bool opt_track_power_leakage = false;	     // Phase 2: Enable power side-channel leakage tracking.
 	pool<string> opt_conjunctive_cells_pool;     // Whether to implement over-conservatively with plain OR gates.
 	bool opt_conjunctive_gates = false;	     // Whether to implement over-conservatively with plain OR gates.
 	bool opt_precise_shiftx = false;	     // Whether to implement precise IFT logic for the shiftx.
@@ -153,6 +473,34 @@ struct CellIFTWorker {
 			w->port_output = true;
 		}
 
+		// NEW: Create leakage output ports (Stage 1 for leakage)
+		// This mirrors the taint port creation mechanism for leakage signals
+		if (opt_track_power_leakage) {
+			pool<std::pair<RTLIL::IdString, int>> leakage_output_wires_to_add;
+			
+			// Collect all output signals that should have leakage tracking
+			for (auto &wire_it : module->wires_) {
+				if (wire_it.second->port_output && !is_signal_excluded(excluded_signals, wire_it.first.str())) {
+					for (unsigned int leakage_id = 0; leakage_id < num_taints; leakage_id++) {
+						leakage_output_wires_to_add.insert(
+							std::pair<RTLIL::IdString, int>(
+								get_wire_leakage_idstring(wire_it.first, leakage_id),
+								wire_it.second->width
+							)
+						);
+					}
+				}
+			}
+			
+			// Create the leakage output port wires and mark them as visible
+			for (auto &wire_info_it : leakage_output_wires_to_add) {
+				if (opt_verbose)
+					log("New leakage output wire: %s.\n", wire_info_it.first.c_str());
+				RTLIL::Wire *w = module->addWire(wire_info_it.first, wire_info_it.second);
+				w->port_output = true;  // KEY: Make visible as module port!
+			}
+		}
+
 		// True: the cell will be SUPPLEMENTED by the taint tracking logic.
 		// False: the cell will be REPLACED by the taint tracking logic.
 		bool keep_current_cell;
@@ -184,8 +532,12 @@ struct CellIFTWorker {
 			// Flip-flops
 			////
 
-			else if (cell->type.in(ID($dff)))
-				keep_current_cell = cellift_dff(module, cell, num_taints, excluded_signals);
+			else if (cell->type.in(ID($dff))) {
+				if (opt_track_power_leakage)
+					keep_current_cell = cellift_dff_with_leakage(module, cell, num_taints, excluded_signals);
+				else
+					keep_current_cell = cellift_dff(module, cell, num_taints, excluded_signals);
+			}
 
 			else if (cell->type.in(ID($_DFF_NN0_), ID($_DFF_NN1_), ID($_DFF_NP0_), ID($_DFF_NP1_), ID($_DFF_PN0_), ID($_DFF_PN1_),
 					       ID($_DFF_PP0_), ID($_DFF_PP0_)))
@@ -416,6 +768,20 @@ struct CellIFTWorker {
 					for (unsigned int taint_id = 0; taint_id < num_taints; taint_id++) {
 						cell->setPort(get_wire_taint_idstring(it.first.c_str(), taint_id), port_taints[taint_id]);
 					}
+
+					// NEW: Connect leakage ports for hierarchical propagation (only for output ports)
+					if (opt_track_power_leakage) {
+						// Check if this port is an output port in the submodule
+						RTLIL::Module *submodule = module->design->module(cell->type);
+						RTLIL::Wire *port_wire = submodule->wire(it.first);
+						if (port_wire && port_wire->port_output) {
+							std::vector<RTLIL::SigSpec> port_leakages =
+							  get_corresponding_leakage_signals(module, excluded_signals, connected_sig, num_taints);
+							for (unsigned int leakage_id = 0; leakage_id < num_taints; leakage_id++) {
+								cell->setPort(get_wire_leakage_idstring(it.first.c_str(), leakage_id), port_leakages[leakage_id]);
+							}
+						}
+					}
 				}
 			} else
 				log_cmd_error("Cell type not supported: %s. Consider running techmap or creating your own IFT implementation.\n",
@@ -443,12 +809,89 @@ struct CellIFTWorker {
 				module->connect(first[taint_id], second[taint_id]);
 		}
 
+		// NEW: For all original connections, also connect the corresponding leakages.
+		if (opt_track_power_leakage) {
+			for (auto &conn : connections) {
+				log_assert(conn.first.size() == conn.second.size());
+
+				std::vector<RTLIL::SigSpec> first = get_corresponding_leakage_signals(module, excluded_signals, conn.first, num_taints);
+				std::vector<RTLIL::SigSpec> second = get_corresponding_leakage_signals(module, excluded_signals, conn.second, num_taints);
+
+				for (unsigned int leakage_id = 0; leakage_id < num_taints; leakage_id++)
+					module->connect(first[leakage_id], second[leakage_id]);
+			}
+		}
+
+		// Connect taints for internal wires that are aliases of input ports.
+		SigMap sigmap(module);
+		dict<std::string, RTLIL::Wire *> input_by_key;
+		for (auto &wire_it : module->wires_) {
+			RTLIL::Wire *w = wire_it.second;
+			if (!w->port_input)
+				continue;
+			if (is_signal_excluded(excluded_signals, w->name.str()))
+				continue;
+			std::string key = log_signal(sigmap(RTLIL::SigSpec(w)));
+			input_by_key[key] = w;
+		}
+		for (auto &wire_it : module->wires_) {
+			RTLIL::Wire *w = wire_it.second;
+			if (w->port_input || w->port_output)
+				continue;
+			if (is_signal_excluded(excluded_signals, w->name.str()))
+				continue;
+			std::string key = log_signal(sigmap(RTLIL::SigSpec(w)));
+			auto it = input_by_key.find(key);
+			if (it == input_by_key.end())
+				continue;
+
+			RTLIL::SigSpec src = RTLIL::SigSpec(it->second);
+			RTLIL::SigSpec dst = RTLIL::SigSpec(w);
+			std::vector<RTLIL::SigSpec> src_taints =
+				get_corresponding_taint_signals(module, excluded_signals, src, num_taints);
+			std::vector<RTLIL::SigSpec> dst_taints =
+				get_corresponding_taint_signals(module, excluded_signals, dst, num_taints);
+
+			for (unsigned int taint_id = 0; taint_id < num_taints; taint_id++)
+				module->connect(dst_taints[taint_id], src_taints[taint_id]);
+		}
+
+		// Phase 3: Explicit handler for buffer input wires driven by module inputs
+		// Connect TilePRCIDomain inputs directly to buffer_auto_in_0_* internal wires
+		// This covers the case where Chisel/RTL infrastructure wires don't get connected
+		// by default module input matching logic
+		if (module->name == ID(TilePRCIDomain)) {
+			std::vector<std::pair<std::string, std::string>> explicit_connections = {
+				{"buffer_auto_in_0_a_ready_t0", "auto_tl_master_clock_xing_out_0_a_ready_t0"},
+				{"buffer_auto_in_0_d_bits_corrupt_t0", "auto_tl_master_clock_xing_out_0_d_bits_corrupt_t0"},
+				{"buffer_auto_in_0_d_bits_data_t0", "auto_tl_master_clock_xing_out_0_d_bits_data_t0"},
+				{"buffer_auto_in_0_d_bits_denied_t0", "auto_tl_master_clock_xing_out_0_d_bits_denied_t0"},
+				{"buffer_auto_in_0_d_bits_opcode_t0", "auto_tl_master_clock_xing_out_0_d_bits_opcode_t0"},
+				{"buffer_auto_in_0_d_bits_param_t0", "auto_tl_master_clock_xing_out_0_d_bits_param_t0"},
+				{"buffer_auto_in_0_d_bits_sink_t0", "auto_tl_master_clock_xing_out_0_d_bits_sink_t0"},
+				{"buffer_auto_in_0_d_bits_size_t0", "auto_tl_master_clock_xing_out_0_d_bits_size_t0"},
+				{"buffer_auto_in_0_d_bits_source_t0", "auto_tl_master_clock_xing_out_0_d_bits_source_t0"},
+				{"buffer_auto_in_0_d_valid_t0", "auto_tl_master_clock_xing_out_0_d_valid_t0"},
+			};
+
+			for (const auto &conn : explicit_connections) {
+				RTLIL::Wire *dst_w = module->wire(RTLIL::escape_id(conn.first));
+				RTLIL::Wire *src_w = module->wire(RTLIL::escape_id(conn.second));
+
+				if (dst_w && src_w) {
+					if (opt_verbose)
+						log("  Phase 3: Connecting %s <- %s\n", conn.first.c_str(), conn.second.c_str());
+					module->connect(RTLIL::SigSpec(dst_w), RTLIL::SigSpec(src_w));
+				}
+			}
+		}
+
 		module->fixup_ports();
 		module->set_bool_attribute(cellift_attribute_name, true);
 	}
 
       public:
-	CellIFTWorker(RTLIL::Module *_module, bool _opt_verbose, bool _opt_rtlift, bool _opt_conjunctive_gates,
+	CellIFTWorker(RTLIL::Module *_module, bool _opt_verbose, bool _opt_rtlift, bool _opt_track_power_leakage, bool _opt_conjunctive_gates,
 		      pool<string> _opt_conjunctive_cells_pool, bool _opt_precise_shiftx, bool _opt_imprecise_shl_sshl, bool _opt_imprecise_shr_sshr,
 		      bool _opt_pmux_use_large_cells, int unsigned _num_taints,
 		      std::vector<string> *_excluded_signals)
@@ -456,6 +899,7 @@ struct CellIFTWorker {
 		module = _module;
 		opt_verbose = _opt_verbose;
 		opt_rtlift = _opt_rtlift;
+		opt_track_power_leakage = _opt_track_power_leakage;
 		opt_conjunctive_gates = _opt_conjunctive_gates;
 		opt_conjunctive_cells_pool = _opt_conjunctive_cells_pool;
 		opt_precise_shiftx = _opt_precise_shiftx;
@@ -498,6 +942,24 @@ struct CelliftPass : public Pass {
 		log("\n");
 		log("  -verbose\n");
 		log("    Verbose mode.\n");
+		log("\n");
+		log("  -track-power-leakage\n");
+		log("    Enable power side-channel leakage tracking (Phase 2 feature).\n");
+		log("    Instruments flip-flops to track switching transitions on tainted paths.\n");
+		log("    Creates additional '_leak' shadow signals for leakage analysis.\n");
+		log("    Default: disabled (standard CellIFT behavior).\n");
+		log("\n");
+		log("  -power-leakage-scope <module_name>\n");
+		log("    Specify which module(s) to aggregate HW/HD counters in (comma-separated).\n");
+		log("    By default, counters are aggregated in the top module only.\n");
+		log("    Use this when tainted signals are internal to a core module.\n");
+		log("    Example: -power-leakage-scope cellift_ibex_core\n");
+		log("    Example: -power-leakage-scope \"BoomCore,RocketCore\"\n");
+		log("\n");
+		log("  -power-leakage-auto-scope\n");
+		log("    Automatically detect modules with tainted signals and aggregate counters there.\n");
+		log("    Overrides -power-leakage-scope if both are specified.\n");
+		log("    Recommended for designs where taint location is unknown.\n");
 		log("\n");
 		log("  -exclude-signals\n");
 		log("    Exclude a list of signal names from the IFT. Typically, this comprises clock and reset signals.\n");
@@ -545,6 +1007,10 @@ struct CelliftPass : public Pass {
 	{
 		bool opt_verbose = false;
 		bool opt_rtlift = false;
+		bool opt_track_power_leakage = false;  // Phase 2: Power leakage tracking
+		bool opt_power_leakage_auto_scope = false;  // Auto-detect modules for aggregation
+		string opt_power_leakage_scope_csv;  // Comma-separated module names
+		std::vector<string> opt_power_leakage_scope_modules;  // Parsed module names
 		bool opt_conjunctive_gates = false;
 		pool<string> opt_conjunctive_cells_pool;
 		bool opt_precise_shiftx = false;
@@ -565,6 +1031,18 @@ struct CelliftPass : public Pass {
 			}
 			if (args[argidx] == "-verbose") {
 				opt_verbose = true;
+				continue;
+			}
+			if (args[argidx] == "-track-power-leakage") {
+				opt_track_power_leakage = true;
+				continue;
+			}
+			if (args[argidx] == "-power-leakage-scope") {
+				opt_power_leakage_scope_csv = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-power-leakage-auto-scope") {
+				opt_power_leakage_auto_scope = true;
 				continue;
 			}
 			if (args[argidx] == "-rtlift") {
@@ -736,12 +1214,177 @@ struct CelliftPass : public Pass {
 		} else if (opt_verbose)
 			log("No -exclude-signals has been provided. \n");
 
+		// Parse the power leakage scope modules.
+		if (opt_power_leakage_scope_csv.size()) {
+			char delimiter = ',';
+			int csv_start = 0;
+			int end = opt_power_leakage_scope_csv.find(delimiter);
+			while (end != -1) {
+				string module_name = opt_power_leakage_scope_csv.substr(csv_start, end - csv_start);
+				// Add backslash prefix if not present (Yosys internal format)
+				if (!module_name.empty() && module_name[0] != '\\')
+					module_name = "\\" + module_name;
+				opt_power_leakage_scope_modules.push_back(module_name);
+				csv_start = end + 1;
+				end = opt_power_leakage_scope_csv.find(delimiter, csv_start);
+			}
+			string module_name = opt_power_leakage_scope_csv.substr(csv_start, end - csv_start);
+			if (!module_name.empty() && module_name[0] != '\\')
+				module_name = "\\" + module_name;
+			opt_power_leakage_scope_modules.push_back(module_name);
+			
+			if (opt_verbose) {
+				log("Power leakage scope modules: ");
+				for (auto &m : opt_power_leakage_scope_modules)
+					log("%s ", m.c_str());
+				log("\n");
+			}
+		}
+
 		// Run the worker on each module.
 		for (auto i = 0; i < GetSize(topo_modules.sorted); ++i) {
 			RTLIL::Module *module = topo_modules.sorted[i];
-			CellIFTWorker(module, opt_verbose, opt_rtlift, opt_conjunctive_gates, opt_conjunctive_cells_pool, opt_precise_shiftx,
+			CellIFTWorker(module, opt_verbose, opt_rtlift, opt_track_power_leakage, opt_conjunctive_gates, opt_conjunctive_cells_pool, opt_precise_shiftx,
 				      opt_imprecise_shl_sshl, opt_imprecise_shr_sshr, opt_pmux_use_large_cells,
 				      num_taints, &opt_excluded_signals);
+		}
+
+		// Step 4: Add top-level leakage aggregation if enabled
+		if (opt_track_power_leakage && topo_modules.sorted.size() > 0) {
+			// Find the top module (the last one in topological order)
+			RTLIL::Module *top_module = topo_modules.sorted[topo_modules.sorted.size() - 1];
+			
+			// Check if this module is the top module (has no parent cells)
+			bool is_top = true;
+			for (auto mod : design->modules()) {
+				for (auto cell : mod->cells()) {
+					if (design->module(cell->type) == top_module) {
+						is_top = false;
+						break;
+					}
+				}
+				if (!is_top) break;
+			}
+			
+			if (is_top && opt_verbose) {
+				log("Step 4: Adding leakage aggregation counters\n");
+			}
+			
+			if (is_top) {
+				// Determine which modules should have HW/HD counters
+				std::vector<RTLIL::Module*> target_modules;
+				
+				if (opt_power_leakage_auto_scope) {
+					// Auto-detect all modules with tainted signals
+					if (opt_verbose)
+						log("  Using auto-scope: detecting tainted modules\n");
+					target_modules = detect_tainted_modules(design, opt_verbose);
+				} else if (!opt_power_leakage_scope_modules.empty()) {
+					// Use explicitly specified scope modules
+					if (opt_verbose)
+						log("  Using explicit scope modules\n");
+					for (auto &module_name : opt_power_leakage_scope_modules) {
+						std::vector<RTLIL::Module*> matches = find_modules_by_name(design, module_name, opt_verbose);
+						if (!matches.empty()) {
+							for (auto match : matches) {
+								target_modules.push_back(match);
+							}
+						} else {
+							log_warning("Scope module not found: %s\n", module_name.c_str());
+						}
+					}
+				} else {
+					// Default: aggregate in top module only (backward compatible)
+					if (opt_verbose)
+						log("  Using default scope: top module only\n");
+					target_modules.push_back(top_module);
+				}
+
+				// Add HW/HD counters to target modules
+				for (auto target_mod : target_modules) {
+					bool is_top_level = (target_mod == top_module);
+					add_hw_hd_counters_to_module(target_mod, num_taints, opt_verbose, is_top_level);
+					
+					// If this is not the top module, promote counters hierarchically
+					if (!is_top_level) {
+						promote_counters_hierarchically(design, target_mod, num_taints, opt_verbose);
+					}
+				}
+
+				// Add legacy leakage_counter for backward compatibility (OR reduction of all leakage wires)
+				// This is done only at top level
+				for (unsigned int taint_id = 0; taint_id < num_taints; ++taint_id) {
+					std::string counter_name = "leakage_counter_t" + std::to_string(taint_id);
+					RTLIL::IdString counter_id = RTLIL::escape_id(counter_name);
+					
+					// Create counter wire if it doesn't exist
+					RTLIL::Wire *counter_wire = top_module->wire(counter_id);
+					if (!counter_wire) {
+						counter_wire = top_module->addWire(counter_id, 32);
+						counter_wire->port_output = true;
+						if (opt_verbose)
+							log("  Created leakage_counter_t%d output (32-bit)\n", taint_id);
+					}
+
+					// Identify a clock for the counter
+					RTLIL::Wire *clk_wire = nullptr;
+					for (auto &wire_it : top_module->wires_) {
+						RTLIL::Wire *w = wire_it.second;
+						if (!w->port_input)
+							continue;
+						std::string n = w->name.str();
+						if (n.find("_t0") != std::string::npos || n.find("_leak") != std::string::npos)
+							continue;
+						if (n == "\\clk_i" || n.find("clk_i") != std::string::npos) {
+							clk_wire = w;
+							break;
+						}
+						if (!clk_wire && (n.find("clk") != std::string::npos || n.find("clock") != std::string::npos))
+							clk_wire = w;
+					}
+
+					// Aggregate all leakage wires for this taint label.
+					RTLIL::SigSpec all_leaks;
+					std::string leak_suffix = "_leak" + std::to_string(taint_id);
+					for (auto &wire_it : top_module->wires_) {
+						RTLIL::Wire *w = wire_it.second;
+						if (w->name.str().find(leak_suffix) != std::string::npos)
+							all_leaks.append(RTLIL::SigSpec(w));
+					}
+
+					if (all_leaks.size() == 0) {
+						if (opt_verbose)
+							log("  Warning: No leakage wires found for taint %d in top module.\n", taint_id);
+						continue;
+					}
+
+					// Reduce OR across all leakage wires.
+					RTLIL::SigSpec leak_active = top_module->ReduceOr(NEW_ID, all_leaks);
+					RTLIL::Wire *leak_active_wire = top_module->addWire(NEW_ID, 1);
+					top_module->connect(leak_active_wire, leak_active);
+
+					// If we have a clock, create a registered counter; otherwise, expose a combinational value.
+					if (clk_wire) {
+						RTLIL::Wire *counter_reg = top_module->addWire(NEW_ID, 32);
+						RTLIL::SigSpec leak_ext = RTLIL::SigSpec(leak_active_wire);
+						if (leak_ext.size() < 32)
+							leak_ext.append(RTLIL::SigSpec(RTLIL::State::S0, 32 - leak_ext.size()));
+						// Per-cycle leakage counter: expose instantaneous activity (0/1 per cycle),
+						// not a running cumulative sum.
+						RTLIL::SigSpec next_val = leak_ext;
+						top_module->addDff(NEW_ID, RTLIL::SigSpec(clk_wire), next_val, RTLIL::SigSpec(counter_reg));
+						top_module->connect(counter_wire, counter_reg);
+					} else {
+						// Fall back to a 0/1 combinational indicator if no clock was found.
+						RTLIL::SigSpec leak_ext = RTLIL::SigSpec(leak_active_wire);
+						if (leak_ext.size() < 32)
+							leak_ext.append(RTLIL::SigSpec(RTLIL::State::S0, 32 - leak_ext.size()));
+						top_module->connect(counter_wire, leak_ext);
+					}
+				}
+				
+				top_module->fixup_ports();
+			}
 		}
 	}
 } CelliftPass;

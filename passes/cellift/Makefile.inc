@@ -1,6 +1,7 @@
 
 OBJS += passes/cellift/cellift.o
 OBJS += passes/cellift/cellift_util.o
+OBJS += passes/cellift/cellift_util_leakage.o
 OBJS += passes/cellift/cells/stateful/adff.o
 OBJS += passes/cellift/cells/stateful/adffe.o
 OBJS += passes/cellift/cells/stateful/dff.o
@@ -17,6 +18,7 @@ OBJS += passes/cellift/cells/stateful/sdffce_techmap.o
 OBJS += passes/cellift/cells/stateful/sdffe.o
 OBJS += passes/cellift/cells/stateful/sdffe_techmap.o
 OBJS += passes/cellift/cells/stateful/sdff_techmap.o
+OBJS += passes/cellift/cells/stateful/power_leakage/dff_leakage.o
 OBJS += passes/cellift/cells/add.o
 OBJS += passes/cellift/cells/and.o
 OBJS += passes/cellift/cells/eq_ne.o
