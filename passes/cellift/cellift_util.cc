@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: ISC
+// Copyright (C) 2020 Alberto Gonzalez & Flavien Solt
+
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
 #include "kernel/utils.h"

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: ISC
+// Copyright (C) 2024-2026 Andrija Neskovic, University of Luebeck
+// Power leakage extension; base CellIFT pass: Copyright (C) 2020 Alberto Gonzalez & Flavien Solt
+
 #include "kernel/rtlil.h"
 #include "kernel/utils.h"
 #include "kernel/log.h"
