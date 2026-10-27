@@ -125,31 +125,82 @@ static RTLIL::SigSpec popcount_bits(RTLIL::Module *module, const RTLIL::SigSpec 
 
 // General function to add HW/HD counters to any module
 // This works for top modules as well as internal core modules
-static void add_hw_hd_counters_to_module(RTLIL::Module *target_module, unsigned int num_taints, bool opt_verbose, bool is_top_module)
+static void add_hw_hd_counters_to_module(RTLIL::Module *target_module, unsigned int num_taints, bool opt_verbose, bool is_top_module, bool opt_hd_taint_prev, const std::vector<std::string> &counter_include)
 {
 	if (opt_verbose)
 		log("Adding HW/HD counters to module %s (is_top=%d)\n", target_module->name.c_str(), is_top_module);
 
 	// Identify a clock and optional reset in the target module.
+	//
+	// This used to be a bare substring search for "clk"/"clock" over the input
+	// ports, with no width check, taking the first hit in whatever order the
+	// wire dict happened to yield. That is wrong in two ways, and both bite as
+	// soon as the scope covers more than a hand-written wrapper:
+	//
+	//   * A WIDE port whose name merely CONTAINS the word. Rocket's
+	//     `SystemBus` has an input called
+	//     `auto_coupler_from_tile_tl_master_clock_xing_in_a_bits_address` --
+	//     a TileLink address bus. The old code selected it as the clock and
+	//     the pass aborted in rtlil.cc's cell checker, because a $dff CLK
+	//     must be one bit. A clock or reset is a single bit, always, so
+	//     requiring width == 1 is both correct and sufficient to exclude this
+	//     whole class.
+	//   * Non-determinism. `wires_` is a dict, so "first match" is not a
+	//     stable choice when several ports match. Score every candidate and
+	//     break ties on the name, so the same netlist always gets the same
+	//     clock.
+	//
+	// Scores, highest wins: an exact conventional name, then one ending in
+	// the word (`..._clk`, `..._clock`), then a bare containment as the last
+	// resort. `clk_i`/`rst_ni` keep their historical precedence so existing
+	// designs select exactly the wire they selected before.
 	RTLIL::Wire *clk_wire = nullptr;
 	RTLIL::Wire *rst_wire = nullptr;
-	for (auto &wire_it : target_module->wires_) {
-		RTLIL::Wire *w = wire_it.second;
-		if (!w->port_input)
-			continue;
-		std::string n = w->name.str();
-		// Skip taint/leakage variants when selecting clocks/resets.
-		if (n.find("_t0") != std::string::npos || n.find("_leak") != std::string::npos)
-			continue;
-		// Prefer the main system clock if present.
-		if (n == "\\clk_i" || n.find("clk_i") != std::string::npos) {
-			clk_wire = w;
-			continue;
+	{
+		int best_clk = 0, best_rst = 0;
+		auto ends_with = [](const std::string &h, const std::string &t) {
+			return h.size() >= t.size() && h.compare(h.size() - t.size(), t.size(), t) == 0;
+		};
+		for (auto &wire_it : target_module->wires_) {
+			RTLIL::Wire *w = wire_it.second;
+			if (!w->port_input)
+				continue;
+			// A clock or a reset is one bit. This is the check whose absence
+			// let a TileLink address bus be chosen as a clock.
+			if (w->width != 1)
+				continue;
+			std::string n = w->name.str();
+			// Skip taint/leakage variants when selecting clocks/resets.
+			if (n.find("_t0") != std::string::npos || n.find("_leak") != std::string::npos)
+				continue;
+
+			int cs = 0;
+			if (n == "\\clk_i")                              cs = 5;
+			else if (n == "\\clk" || n == "\\clock")        cs = 4;
+			else if (ends_with(n, "_clk") || ends_with(n, "_clock")) cs = 3;
+			else if (n.find("clk_i") != std::string::npos)     cs = 2;
+			else if (n.find("clk") != std::string::npos ||
+			         n.find("clock") != std::string::npos)     cs = 1;
+			if (cs > best_clk || (cs == best_clk && cs > 0 && clk_wire &&
+			                      n < clk_wire->name.str())) {
+				best_clk = cs;
+				clk_wire = w;
+			}
+
+			int rs = 0;
+			if (n == "\\rst_ni")                              rs = 5;
+			else if (n == "\\rst" || n == "\\reset" ||
+			         n == "\\rst_n" || n == "\\resetn")      rs = 4;
+			else if (ends_with(n, "_rst") || ends_with(n, "_reset") ||
+			         ends_with(n, "_rst_n") || ends_with(n, "_resetn")) rs = 3;
+			else if (n.find("rst") != std::string::npos ||
+			         n.find("reset") != std::string::npos)      rs = 1;
+			if (rs > best_rst || (rs == best_rst && rs > 0 && rst_wire &&
+			                      n < rst_wire->name.str())) {
+				best_rst = rs;
+				rst_wire = w;
+			}
 		}
-		if (!clk_wire && (n.find("clk") != std::string::npos || n.find("clock") != std::string::npos))
-			clk_wire = w;
-		if (!rst_wire && (n == "\\rst_ni" || n.find("rst") != std::string::npos || n.find("reset") != std::string::npos))
-			rst_wire = w;
 	}
 
 	if (!clk_wire && opt_verbose)
@@ -158,6 +209,10 @@ static void add_hw_hd_counters_to_module(RTLIL::Module *target_module, unsigned 
 	// Build dictionary of data wires (excluding taint and leakage signals)
 	dict<std::string, RTLIL::Wire *> data_wires;
 	dict<std::string, RTLIL::Wire *> prev_wires;
+	// Registered taint, for the HD gate below. Keyed by the TAINT wire's name,
+	// not the base name: the data flop is shared across taint labels, a taint
+	// flop is per label.
+	dict<std::string, RTLIL::Wire *> prev_taint_wires;
 	for (auto &wire_it : target_module->wires_) {
 		RTLIL::Wire *w = wire_it.second;
 		std::string n = w->name.str();
@@ -174,9 +229,19 @@ static void add_hw_hd_counters_to_module(RTLIL::Module *target_module, unsigned 
 		RTLIL::SigSpec hw_bits;
 		RTLIL::SigSpec hd_bits;
 
+		// Snapshot the wire list before touching it. The body below calls
+		// addWire (the _prev_hw_hd flops), which inserts into wires_ and can
+		// rehash it, and iterating a container while inserting into it is
+		// undefined. The pre-existing code did exactly that with one insertion
+		// per pair; gating HD on the registered taint adds a second, so take
+		// the snapshot rather than widen the window.
+		std::vector<RTLIL::Wire *> candidate_wires;
+		candidate_wires.reserve(target_module->wires_.size());
+		for (auto &wire_it : target_module->wires_)
+			candidate_wires.push_back(wire_it.second);
+
 		// Iterate through all wires in the target module, looking for tainted signals
-		for (auto &wire_it : target_module->wires_) {
-			RTLIL::Wire *taint_wire = wire_it.second;
+		for (RTLIL::Wire *taint_wire : candidate_wires) {
 			std::string tn = taint_wire->name.str();
 			
 			// Check if this is a taint signal (ends with _t<id>)
@@ -193,6 +258,28 @@ static void add_hw_hd_counters_to_module(RTLIL::Module *target_module, unsigned 
 			if (it == data_wires.end())
 				continue;
 			RTLIL::Wire *data_wire = it->second;
+
+			// Optional allowlist, restricting which wires feed the COUNTERS.
+			// Taint propagation is untouched -- this only narrows the HW/HD
+			// aggregation.
+			//
+			// Why this exists: popcount_bits() sums the tainted bits with one
+			// 32-bit adder PER BIT, chained serially, so the simulator's cost
+			// scales with the total instrumented bit count. A flattened Ibex
+			// reaches 16029 tainted bits, i.e. ~32000 chained 32-bit adders
+			// across the two counters, and a single 30k-cycle trace then takes
+			// over 17 minutes against seconds unflattened. Flattening is what
+			// makes the core's internals visible at all (unflattened, only the
+			// wrapper's 31 memory-boundary wires are instrumented), so the way
+			// out is to flatten AND name the few nets under investigation:
+			// an allowlist of "register_file_i" is ~1160 bits instead of 16029.
+			if (!counter_include.empty()) {
+				bool wanted = false;
+				for (const std::string &pat : counter_include)
+					if (base_name.find(pat) != std::string::npos) { wanted = true; break; }
+				if (!wanted)
+					continue;
+			}
 
 			// HW: AND(data, taint) for each bit
 			RTLIL::SigSpec data_sig(data_wire);
@@ -213,7 +300,64 @@ static void add_hw_hd_counters_to_module(RTLIL::Module *target_module, unsigned 
 					prev_wires[base_name] = prev_wire;
 				}
 				RTLIL::SigSpec xor_sig = target_module->Xor(NEW_ID, data_sig, RTLIL::SigSpec(prev_wire));
-				RTLIL::SigSpec hd_and = target_module->And(NEW_ID, xor_sig, taint_sig);
+
+				// The gate on the transition. Plainly `& taint` scores a
+				// transition only if the value is tainted in the CURRENT cycle,
+				// which silently drops the case where a tainted value is
+				// overwritten by an untainted one. That case is not exotic: it
+				// is Gigerl et al.'s C2 ("a register holding one share must not
+				// be overwritten with its counterpart"), the commonest masking
+				// implementation bug, and the counterpart is untainted whenever
+				// the taint source is one share only -- which is how every
+				// scenario in this tree is configured. The transition is
+				// physically key-dependent (it toggles by HW(share0 ^ share1) =
+				// HW of the true value) and the model reports exactly 0.00 for
+				// it. Measured on Ibex: HD is identically zero in both groups over
+				// 400 traces, although the transition at those cycles is
+				// key-dependent by construction.
+				//
+				// `| taint_prev` fixes that: a transition counts if a tainted
+				// value took part in it, at either end. HW is untouched.
+				//
+				// KEEP THIS OFF unless you know why you want it. It is an
+				// over-approximation, but an over-approximation that INVENTS
+				// STRUCTURE, which is worse than useless for attribution --
+				// SPARC's whole purpose. Measured on Ibex masked AES with the
+				// register file instrumented, N=60/group, fixed-vs-random key:
+				//
+				//   gate            HD leaky cycles   max |t|
+				//   taint            7 (key schedule)   7.05
+				//   taint|taint_prev 12                20.09
+				//
+				// The five extra cycles formed a clean 1694-cycle grid -- one
+				// per AES round, zero drift -- attributing to AddRoundKey's
+				// state[i] ^= rk_share[i]. It looks exactly like a real
+				// round-periodic leak and it is not: with the strict gate it
+				// vanishes entirely. The cause is that `taint | taint_prev`
+				// counts a transition whose endpoints are tainted in DIFFERENT
+				// cycles, so a register reloaded with fresh tainted data every
+				// iteration fires once per round at fixed phase. The surviving
+				// 7 cycles are the real residual, and they attribute to
+				// aes128_sw_masktable.c:383-386.
+				//
+				// So it does not merely rescale HD, it changes which cycles
+				// are flagged and would have to be re-validated against
+				// silicon before it could ever be a default.
+				RTLIL::SigSpec hd_gate = taint_sig;
+				if (opt_hd_taint_prev) {
+					RTLIL::Wire *prev_taint = nullptr;
+					auto pt_it = prev_taint_wires.find(tn);
+					if (pt_it != prev_taint_wires.end()) {
+						prev_taint = pt_it->second;
+					} else {
+						std::string pt_name = base_name + taint_suffix + "_prev_hw_hd";
+						prev_taint = target_module->addWire(RTLIL::escape_id(pt_name), taint_wire->width);
+						target_module->addDff(NEW_ID, RTLIL::SigSpec(clk_wire), taint_sig, RTLIL::SigSpec(prev_taint));
+						prev_taint_wires[tn] = prev_taint;
+					}
+					hd_gate = target_module->Or(NEW_ID, taint_sig, RTLIL::SigSpec(prev_taint));
+				}
+				RTLIL::SigSpec hd_and = target_module->And(NEW_ID, xor_sig, hd_gate);
 				hd_bits.append(hd_and);
 			}
 		}
@@ -264,81 +408,116 @@ static void add_hw_hd_counters_to_module(RTLIL::Module *target_module, unsigned 
 	target_module->fixup_ports();
 }
 
-// Function to promote counter outputs hierarchically from child module to parent
-static void promote_counters_hierarchically(RTLIL::Design *design, RTLIL::Module *child_module, unsigned int num_taints, bool opt_verbose)
+// ---------------------------------------------------------------------------
+// Hierarchical counter aggregation.
+//
+// The previous implementation (promote_counters_hierarchically) created a
+// per-instance wire in the parent and connected the child's counter port to
+// it -- and stopped. It never summed the per-instance wires, never drove a
+// counter output on the parent, and never recursed toward the top, so every
+// promoted wire dangled and `opt -purge` reclaimed it. That is why
+// -power-leakage-auto-scope never produced a usable counter, and why
+// instrumenting a deep module (a register file, say) yielded nothing at the
+// top: the counters existed, but nothing added them up.
+//
+// This walks the instantiation DAG in post-order (children finished before
+// their parents) and drives each module's counter output with
+//
+//     its own local counter, if it has one  +  the sum over its instances
+//
+// The sum is deliberately COMBINATIONAL. Every contributing counter is already
+// registered once at the level that produced it, so adding a register per
+// hierarchy level would skew deeper modules by one cycle per level and
+// misalign the per-cycle trace the whole TVLA flow rests on.
+// ---------------------------------------------------------------------------
+
+static void aggregate_counters_in_module(RTLIL::Design *design, RTLIL::Module *mod,
+                                         unsigned int num_taints, bool opt_verbose,
+                                         pool<RTLIL::Module *> &done)
+{
+	if (!mod || done.count(mod))
+		return;
+	done.insert(mod);
+
+	// Children first.
+	for (auto cell : mod->cells()) {
+		RTLIL::Module *sub = design->module(cell->type);
+		if (sub)
+			aggregate_counters_in_module(design, sub, num_taints, opt_verbose, done);
+	}
+
+	static const char *kinds[2] = { "hamming_weight", "hamming_distance" };
+
+	for (unsigned int taint_id = 0; taint_id < num_taints; ++taint_id) {
+		for (int k = 0; k < 2; ++k) {
+			std::string pname = std::string(kinds[k]) + "_counter_t" + std::to_string(taint_id);
+			RTLIL::IdString pid = RTLIL::escape_id(pname);
+
+			// One term per instantiated child that exposes this counter.
+			std::vector<RTLIL::SigSpec> terms;
+			for (auto cell : mod->cells()) {
+				RTLIL::Module *sub = design->module(cell->type);
+				if (!sub)
+					continue;
+				RTLIL::Wire *sub_port = sub->wire(pid);
+				if (!sub_port || !sub_port->port_output)
+					continue;
+
+				std::string rn = RTLIL::unescape_id(cell->name) + "_" + pname;
+				RTLIL::IdString rid = RTLIL::escape_id(rn);
+				RTLIL::Wire *recv = mod->wire(rid);
+				if (!recv)
+					recv = mod->addWire(rid, 32);
+				cell->setPort(pid, RTLIL::SigSpec(recv));
+				terms.push_back(RTLIL::SigSpec(recv));
+			}
+
+			if (terms.empty())
+				continue;
+
+			// If this module already has its own counter output, take over its
+			// driver so the local contribution becomes one more term, rather
+			// than being overwritten by the children's sum.
+			RTLIL::Wire *port = mod->wire(pid);
+			RTLIL::SigSpec local;
+			bool has_local = false;
+			if (port) {
+				for (auto it = mod->connections_.begin(); it != mod->connections_.end(); ++it) {
+					if (it->first == RTLIL::SigSpec(port)) {
+						local = it->second;
+						mod->connections_.erase(it);
+						has_local = true;
+						break;
+					}
+				}
+			} else {
+				port = mod->addWire(pid, 32);
+			}
+			port->port_output = true;
+
+			RTLIL::SigSpec total = has_local ? zero_extend_to_32(local)
+			                                 : RTLIL::SigSpec(RTLIL::State::S0, 32);
+			for (auto &t : terms)
+				total = add_to_accum(mod, total, t);
+
+			mod->connect(RTLIL::SigSpec(port), total);
+
+			if (opt_verbose)
+				log("  %s: %d instance counter(s)%s -> %s\n", mod->name.c_str(),
+				    (int)terms.size(), has_local ? " + local" : "", pname.c_str());
+		}
+	}
+
+	mod->fixup_ports();
+}
+
+static void aggregate_counters_bottom_up(RTLIL::Design *design, RTLIL::Module *top_module,
+                                         unsigned int num_taints, bool opt_verbose)
 {
 	if (opt_verbose)
-		log("Promoting counters from module %s to parent modules\n", child_module->name.c_str());
-
-	// Find all parent modules that instantiate this child module
-	std::vector<std::pair<RTLIL::Module*, RTLIL::Cell*>> parent_instances;
-	for (auto parent_mod : design->modules()) {
-		for (auto cell : parent_mod->cells()) {
-			if (design->module(cell->type) == child_module) {
-				parent_instances.push_back(std::make_pair(parent_mod, cell));
-			}
-		}
-	}
-
-	if (parent_instances.empty()) {
-		if (opt_verbose)
-			log("  Module %s is top-level, no promotion needed\n", child_module->name.c_str());
-		return;
-	}
-
-	// For each parent instance, connect child counters to parent wires
-	for (auto &parent_pair : parent_instances) {
-		RTLIL::Module *parent = parent_pair.first;
-		RTLIL::Cell *inst_cell = parent_pair.second;
-		std::string inst_name = inst_cell->name.str();
-
-		if (opt_verbose)
-			log("  Promoting to parent %s via instance %s\n", parent->name.c_str(), inst_name.c_str());
-
-		for (unsigned int taint_id = 0; taint_id < num_taints; ++taint_id) {
-			// Promote HW counter
-			std::string hw_name = "hamming_weight_counter_t" + std::to_string(taint_id);
-			RTLIL::IdString hw_port = RTLIL::escape_id(hw_name);
-			RTLIL::Wire *child_hw = child_module->wire(hw_port);
-			
-			if (child_hw && child_hw->port_output) {
-				// Create wire in parent module
-				std::string parent_hw_name = inst_name + "_" + hw_name;
-				RTLIL::IdString parent_hw_id = RTLIL::escape_id(parent_hw_name);
-				RTLIL::Wire *parent_hw = parent->wire(parent_hw_id);
-				if (!parent_hw) {
-					parent_hw = parent->addWire(parent_hw_id, 32);
-					if (opt_verbose)
-						log("    Created wire %s in parent\n", parent_hw_name.c_str());
-				}
-				
-				// Connect instance port to parent wire
-				inst_cell->setPort(hw_port, RTLIL::SigSpec(parent_hw));
-			}
-
-			// Promote HD counter
-			std::string hd_name = "hamming_distance_counter_t" + std::to_string(taint_id);
-			RTLIL::IdString hd_port = RTLIL::escape_id(hd_name);
-			RTLIL::Wire *child_hd = child_module->wire(hd_port);
-			
-			if (child_hd && child_hd->port_output) {
-				// Create wire in parent module
-				std::string parent_hd_name = inst_name + "_" + hd_name;
-				RTLIL::IdString parent_hd_id = RTLIL::escape_id(parent_hd_name);
-				RTLIL::Wire *parent_hd = parent->wire(parent_hd_id);
-				if (!parent_hd) {
-					parent_hd = parent->addWire(parent_hd_id, 32);
-					if (opt_verbose)
-						log("    Created wire %s in parent\n", parent_hd_name.c_str());
-				}
-				
-				// Connect instance port to parent wire
-				inst_cell->setPort(hd_port, RTLIL::SigSpec(parent_hd));
-			}
-		}
-
-		parent->fixup_ports();
-	}
+		log("Aggregating HW/HD counters bottom-up from %s\n", top_module->name.c_str());
+	pool<RTLIL::Module *> done;
+	aggregate_counters_in_module(design, top_module, num_taints, opt_verbose, done);
 }
 
 // Auto-detect modules that contain tainted signals
@@ -961,6 +1140,24 @@ struct CelliftPass : public Pass {
 		log("    Overrides -power-leakage-scope if both are specified.\n");
 		log("    Recommended for designs where taint location is unknown.\n");
 		log("\n");
+		log("  -power-leakage-include-signals\n");
+		log("    Comma-separated wire-name substrings. When given, ONLY matching wires\n");
+		log("    contribute to the HW/HD counters; taint propagation is unaffected. The\n");
+		log("    counters sum one 32-bit adder per tainted bit, chained, so simulation\n");
+		log("    cost scales with the instrumented bit count -- a flattened CPU reaches\n");
+		log("    ~16k bits and becomes impractically slow. Use this to flatten (which is\n");
+		log("    what exposes a core's internals) while measuring only the nets under\n");
+		log("    investigation.\n");
+		log("\n");
+		log("  -hd-taint-prev\n");
+		log("    Gate the Hamming-distance counter on (taint | taint_prev) instead of the\n");
+		log("    current cycle's taint alone, by registering the taint alongside the data.\n");
+		log("    Without it, a tainted value overwritten by an UNTAINTED one scores zero,\n");
+		log("    although that transition is key-dependent -- which is exactly a C2 share\n");
+		log("    violation when the taint source is one share of a masked value. Strictly\n");
+		log("    more conservative; the Hamming-weight counter is unaffected. Costs one\n");
+		log("    flip-flop per instrumented wire pair.\n");
+		log("\n");
 		log("  -exclude-signals\n");
 		log("    Exclude a list of signal names from the IFT. Typically, this comprises clock and reset signals.\n");
 		log("    The list must be comma-separated and must contain no space.\n");
@@ -1008,8 +1205,10 @@ struct CelliftPass : public Pass {
 		bool opt_verbose = false;
 		bool opt_rtlift = false;
 		bool opt_track_power_leakage = false;  // Phase 2: Power leakage tracking
+		bool opt_hd_taint_prev = false;        // Gate HD on (taint | taint_prev), not taint alone
 		bool opt_power_leakage_auto_scope = false;  // Auto-detect modules for aggregation
 		string opt_power_leakage_scope_csv;  // Comma-separated module names
+		string opt_counter_include_csv;       // Comma-separated wire-name substrings
 		std::vector<string> opt_power_leakage_scope_modules;  // Parsed module names
 		bool opt_conjunctive_gates = false;
 		pool<string> opt_conjunctive_cells_pool;
@@ -1043,6 +1242,14 @@ struct CelliftPass : public Pass {
 			}
 			if (args[argidx] == "-power-leakage-auto-scope") {
 				opt_power_leakage_auto_scope = true;
+				continue;
+			}
+			if (args[argidx] == "-hd-taint-prev") {
+				opt_hd_taint_prev = true;
+				continue;
+			}
+			if (args[argidx] == "-power-leakage-include-signals") {
+				opt_counter_include_csv = args[++argidx];
 				continue;
 			}
 			if (args[argidx] == "-rtlift") {
@@ -1215,6 +1422,24 @@ struct CelliftPass : public Pass {
 			log("No -exclude-signals has been provided. \n");
 
 		// Parse the power leakage scope modules.
+		std::vector<std::string> counter_include;
+		if (opt_counter_include_csv.size()) {
+			size_t start = 0;
+			while (start <= opt_counter_include_csv.size()) {
+				size_t end = opt_counter_include_csv.find(',', start);
+				std::string tok = opt_counter_include_csv.substr(
+					start, end == std::string::npos ? std::string::npos : end - start);
+				if (!tok.empty())
+					counter_include.push_back(tok);
+				if (end == std::string::npos)
+					break;
+				start = end + 1;
+			}
+			if (opt_verbose)
+				log("Counter allowlist: %d pattern(s); only matching wires feed HW/HD\n",
+				    (int)counter_include.size());
+		}
+
 		if (opt_power_leakage_scope_csv.size()) {
 			char delimiter = ',';
 			int csv_start = 0;
@@ -1251,19 +1476,62 @@ struct CelliftPass : public Pass {
 
 		// Step 4: Add top-level leakage aggregation if enabled
 		if (opt_track_power_leakage && topo_modules.sorted.size() > 0) {
-			// Find the top module (the last one in topological order)
-			RTLIL::Module *top_module = topo_modules.sorted[topo_modules.sorted.size() - 1];
-			
-			// Check if this module is the top module (has no parent cells)
+			// The top module, as Yosys itself resolved it.
+			//
+			// This USED to be `topo_modules.sorted.back()` plus a check that
+			// nothing instantiates it. Both parts are unsound: a topological
+			// sort of the instantiation graph has one root per unreferenced
+			// module, not one overall, so "last" is whichever of them the sort
+			// happened to emit last -- and a dead paramod left behind by
+			// specialisation is unreferenced, so it passes the "nothing
+			// instantiates it" check too.
+			//
+			// That is not hypothetical. On Rocket the heuristic chose a stray
+			// `$paramod$...\plusarg_reader`, so Step 4 instrumented a leaf
+			// with 32 bits and no clock -- which means NO HD counter was
+			// created at all (it needs the data_prev flop) and the HW counter
+			// came out tied to 32'd0, while `rocket_mem_top` got nothing. The
+			// flow always knew better: instrument.ys.tcl runs
+			// `hierarchy -top $TOP_MODULE -check`, so the attribute is set.
+			// Ibex and Proteus were unaffected only because the heuristic
+			// happened to agree with the real top on those two designs.
+			//
+			// Getting this right matters most for -power-leakage-auto-scope
+			// and any explicit scope, because `aggregate_counters_bottom_up`
+			// is ROOTED here: a wrong root leaves every per-module counter
+			// stranded, unable to reach a top-level port the testbench can
+			// read.
+			RTLIL::Module *top_module = design->top_module();
 			bool is_top = true;
-			for (auto mod : design->modules()) {
-				for (auto cell : mod->cells()) {
-					if (design->module(cell->type) == top_module) {
-						is_top = false;
-						break;
+			if (!top_module) {
+				// No `top` attribute (the pass was run without `hierarchy
+				// -top`). Fall back to the old heuristic, and keep its guard,
+				// since in that case we really have no better evidence.
+				top_module = topo_modules.sorted[topo_modules.sorted.size() - 1];
+				for (auto mod : design->modules()) {
+					for (auto cell : mod->cells()) {
+						if (design->module(cell->type) == top_module) {
+							is_top = false;
+							break;
+						}
 					}
+					if (!is_top) break;
 				}
-				if (!is_top) break;
+				if (!is_top)
+					log_warning("No module carries the `top` attribute and the "
+					            "topological fallback (%s) is instantiated by "
+					            "another module, so NO leakage counters were "
+					            "added. Run `hierarchy -top <module>` first.\n",
+					            top_module->name.c_str());
+				else
+					log_warning("No module carries the `top` attribute; falling "
+					            "back to the topological heuristic and using %s "
+					            "as the top. Run `hierarchy -top <module>` to "
+					            "make this deterministic.\n",
+					            top_module->name.c_str());
+			} else if (opt_verbose) {
+				log("  Top module (from the `top` attribute): %s\n",
+				    top_module->name.c_str());
 			}
 			
 			if (is_top && opt_verbose) {
@@ -1301,15 +1569,20 @@ struct CelliftPass : public Pass {
 				}
 
 				// Add HW/HD counters to target modules
+				bool any_non_top = false;
 				for (auto target_mod : target_modules) {
 					bool is_top_level = (target_mod == top_module);
-					add_hw_hd_counters_to_module(target_mod, num_taints, opt_verbose, is_top_level);
-					
-					// If this is not the top module, promote counters hierarchically
-					if (!is_top_level) {
-						promote_counters_hierarchically(design, target_mod, num_taints, opt_verbose);
-					}
+					add_hw_hd_counters_to_module(target_mod, num_taints, opt_verbose, is_top_level, opt_hd_taint_prev, counter_include);
+					if (!is_top_level)
+						any_non_top = true;
 				}
+
+				// One bottom-up pass AFTER every target module has its own
+				// counter, rather than promoting each module as it is created:
+				// a parent can instantiate several instrumented children, and
+				// the sum has to see all of them at once.
+				if (any_non_top)
+					aggregate_counters_bottom_up(design, top_module, num_taints, opt_verbose);
 
 				// Add legacy leakage_counter for backward compatibility (OR reduction of all leakage wires)
 				// This is done only at top level
